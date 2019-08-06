@@ -19,14 +19,16 @@ import math
 # タイマーのインポート
 import time
 # 今回主に使うROSメッセージ型をインポート
-from geometry_msgs.msg import Quaternion, PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import Quaternion, PoseStamped, PoseWithCovarianceStamped, Twist
 # 幾何学変換のための関数
 from tf.transformations import quaternion_from_euler
 from move_base_msgs.msg import MoveBaseActionResult
 
+cont = True
 flag1 = 0
 flag2 = 0
 flag3 = 0
+timeout = 0
 
 class image_converter:
     def __del__(self):
@@ -100,25 +102,32 @@ class image_converter:
             
             # Followの処理
             _, w, _ = cv_image.shape
-            global rot
-            global vel
+            global rot # 回転
+            global vel # 速度
+            global timeout
             rot = 0
             vel = 0
-            if self.cx > w/2.0 + 50:
-                rot = 3.14*(w/2.0 - self.cx)/(w/5.0)
-            elif self.cx < w/2.0 - 50:
-                rot = 3.14*(self.cx - w/2.0)/(w/5.0)
-            else:
+            if self.cx > w/2.0 + 50:		 	# 対象の中心がカメラの中心より右
+                rot = 3.14*(self.cx - w/2.0)/(w*2)
+            elif self.cx < w/2.0 - 50: 			# 対象の中心がカメラの中心より左
+                rot = 3.14*(self.cx - w/2.0)/(w*2)
+            else: 					# 対象の中心がカメラの中心なら回転しない
                 rot = 0
 
-            if self.area > 180000:
+            if self.area > 180000:			# 対象の大きさが一定以上ならストップ
                 vel = 0
-            elif self.area < 50000:
+                rot = 0
+                timeout = timeout + 1
+            elif self.area < 50000:			# 対象の大きさが一定以下なら追わない
                 vel = 0
-            else:
-                vel = (180000 - self.area)/(180000.0/1.0)
-            
+                rot = 0
+                timeout = timeout + 1
+            else:					# 対象の大きさに反比例する
+                vel = 180000.0/(self.area*20.0)
+                timeout = 0
+
             print(self.cx)
+            print("time=" + str(timeout))
             print("vel=" + str(vel))
             print("rot=" + str(rot))
 
@@ -134,8 +143,8 @@ class Wait(smach.State):
 
     def execute(self, userdata):
         rospy.loginfo('Executing state Wait')
-        global flag1
-        while flag1 == 0:
+        global flag1, cont
+        while flag1 == 0 and cont:
             rospy.sleep(0.1)
         return 'outcome1'
 
@@ -170,24 +179,20 @@ class GoStartPoint(smach.State):
         self.goal.pose.position.z = 0.0
         q = quaternion_from_euler(0, 0, math.radians(90))
         self.goal.pose.orientation = Quaternion(*q)
-        #self.goal_pub.publish(self.goal)  # 実際にメッセージを配信
+        self.goal_pub.publish(self.goal)  # 実際にメッセージを配信
         amcl_pose = PoseWithCovarianceStamped()
         rospy.loginfo(self.goal)
 
-        #global flag2
-        #while flag2 == 0:
-        #    rospy.sleep(0.1)
+        global flag2,cont
+        while flag2 == 0 and cont:
+            rospy.sleep(0.1)
         return 'outcome2'
 
 # define state Follow
 class Follow(smach.State):
     def __init__(self):
         smach.State.__init__(self, outcomes=['outcome3'])
-        # ゴール配信者オブジェクトを生成
-        self.goal_pub = rospy.Publisher('/move_base_simple/goal', # トピック名
-                                        PoseStamped,              # 型
-                                        queue_size=1,             # 送信キューのサイズ
-                                        latch=True)               # データを次の更新まで保持する
+        self.cmd_pub = rospy.Publisher('cmd_vel', Twist, queue_size=1)
         # 現在位置を読み込むオブジェクトを生成
         self.pose_sub = rospy.Subscriber('/amcl_pose/pose/pose/postion/x',   # トピック名
                                          PoseWithCovarianceStamped)          # 型
@@ -197,28 +202,31 @@ class Follow(smach.State):
 
         global rot
         global vel
-
-        global flag3
-        while flag3 == 0:
-            self.goal = PoseStamped()
-            self.goal.header.frame_id = 'base_link'        # 世界座標系で指定する
-            self.goal.header.stamp = rospy.Time.now()  # タイムスタンプは今の時間
-            self.goal.pose.position.x = vel
-            self.goal.pose.position.y = 0.0
-            self.goal.pose.position.z = 0.0
-            q = quaternion_from_euler(0, 0, rot)
-            self.goal.pose.orientation = Quaternion(*q)
-            self.goal_pub.publish(self.goal)  # 実際にメッセージを配信
+        global timeout
+        global flag3,cont
+        timeout = 0
+        while timeout < 20 and flag3 == 0 and cont:
+            cmd = Twist()
+            cmd.linear.x = vel
+            cmd.linear.y = 0.0
+            cmd.linear.z = 0.0
+            cmd.angular.x = 0.0
+            cmd.angular.y = 0.0
+            cmd.angular.z = -rot
+            cmd_pub.publish(cmd)
             amcl_pose = PoseWithCovarianceStamped()
-            rospy.loginfo(self.goal)
+            #rospy.loginfo(self.goal)
             rospy.sleep(0.1)
-            
+        
         rospy.signal_shutdown('finish')
         return 'outcome3'
 
 # main
 def main():
     rospy.init_node('state_machine', disable_signals = True)
+
+    global cmd_pub, ic
+    cmd_pub = rospy.Publisher('cmd_vel', Twist, queue_size=1)
 
     # Start image_converter()
     ic = image_converter()
@@ -243,12 +251,37 @@ def main():
     # Execute SMACH plan
     outcome = sm.execute()
     rospy.spin()
+    sis.stop()
     del ic
 
 # handler for signal
 def handler(signal, frame):
-    global cont
+    global cont,cmd_pub,ic
+    del ic
     cont = False
+    rate = rospy.Rate(10) # 10hz
+    rate.sleep()
+    print("shutdown")
+    #goal = PoseStamped()
+    #goal.header.frame_id = 'base_footprint'        # 世界座標系で指定する
+    #goal.header.stamp = rospy.Time.now()  # タイムスタンプは今の時間
+    #goal.pose.position.x = 0.0
+    #goal.pose.position.y = 0.0
+    #goal.pose.position.z = 0.0
+    #q = quaternion_from_euler(0, 0, math.radians(90))
+    #goal.pose.orientation = Quaternion(*q)
+    cmd = Twist()
+    cmd.linear.x = 0.0
+    cmd.linear.y = 0.0
+    cmd.linear.z = 0.0
+    cmd.angular.x = 0.0
+    cmd.angular.y = 0.0
+    cmd.angular.z = 0.0
+    cmd_pub.publish(cmd)
+    #cmd_pub.publish(goal)  # 実際にメッセージを配信
+    rate.sleep()
+    #rospy.loginfo(cmd)
+    rospy.signal_shutdown('finish')
 
 if __name__ == '__main__':
     signal.signal(signal.SIGINT, handler)
